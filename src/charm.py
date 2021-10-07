@@ -87,6 +87,8 @@ class PrometheusCharm(CharmBase):
         self.framework.observe(self.on.ingress_relation_broken, self._configure)
         self.framework.observe(self.on.receive_remote_write_relation_created, self._configure)
         self.framework.observe(self.on.receive_remote_write_relation_broken, self._configure)
+        self.framework.observe(self.on.prometheus_peers_relation_joined, self._configure)
+        self.framework.observe(self.on.prometheus_peers_relation_departed, self._configure)
         self.framework.observe(self.metrics_consumer.on.targets_changed, self._configure)
         self.framework.observe(self.alertmanager_consumer.on.cluster_changed, self._configure)
 
@@ -133,6 +135,7 @@ class PrometheusCharm(CharmBase):
             reloaded = self._prometheus_server.reload_configuration()
             if not reloaded:
                 self.unit.status = BlockedStatus("Failed to load Prometheus config")
+                return
             else:
                 self.unit.status = ActiveStatus()
                 logger.info("Prometheus configuration reloaded")
@@ -141,12 +144,42 @@ class PrometheusCharm(CharmBase):
             container.restart(self._name)
             logger.info("Prometheus (re)started")
 
-        # Provide connection info to any remote write clients.
-        self.remote_write.set_endpoint(
-            port=self._port, ingress_relation="ingress", ingress_address=self._external_hostname
+        address = (
+            f"{self.unit.name.replace('/','-')}.{self.app.name}-endpoints.{self.model.name}.svc.cluster.local"
+            if self.model.get_relation("ingress")
+            else None
         )
 
-        self.unit.status = ActiveStatus()
+        remote_write_plus_ingress_status_message = (
+            "invalid combination of 'ingress', 'receive-remote-write' relations and multiple units"
+        )
+
+        if not self._validate_ingress_and_remote_write():
+            self.unit.status = BlockedStatus(remote_write_plus_ingress_status_message)
+            logger.error(
+                "Using the ingress relation and receiving remote_write relations with more than "
+                "one Prometheus unit; remote_write data is likely to be sent to only one unit."
+            )
+        elif (
+            isinstance(self.unit.status, BlockedStatus)
+            and self.unit.status.message == remote_write_plus_ingress_status_message
+        ):
+            self.unit.status = ActiveStatus()
+
+        # Provide connection info to any remote write clients.
+        self.remote_write.set_endpoint(
+            address=address,
+            port=self._port,
+        )
+
+        if not isinstance(self.unit.status, BlockedStatus):
+            self.unit.status = ActiveStatus()
+
+    def _validate_ingress_and_remote_write(self) -> bool:
+        if not (peer_relation := self.model.get_relation("prometheus-peers")):
+            return True
+
+        return not (self.model.get_relation("ingress") and peer_relation.units)
 
     def _set_alerts(self, container):
         """Create alert rule files for all Prometheus consumers.
@@ -183,7 +216,6 @@ class PrometheusCharm(CharmBase):
         ]
 
         if self.model.get_relation("ingress"):
-
             # TODO The ingress should communicate the externally-visible scheme
             external_url = f"http://{self._external_hostname}:{self._port}"
 

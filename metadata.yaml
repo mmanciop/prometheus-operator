@@ -33,6 +33,10 @@ requires:
     interface: alertmanager_dispatch
   ingress:
     interface: ingress
+    limit: 1
+peers:
+  prometheus-peers:
+    interface: prometheus_peers
 storage:
   database:
     type: filesystem
